@@ -1124,16 +1124,27 @@ async function getLogsNewestFirst({ address, topic0, topic1, topic2, fromBlock, 
 // tickSpacing, tickLower, tickUpper, liquidity, fee checkpoints, tokens owed); and rewards accrue to every position
 // (nothing is staked), read per NFT from the pool's gauge. The manager and gauges are found from the factory's voter.
 const RAM_SEL = { voter: '46c96aac', nfpManager: '98bbc3c7', gaugeForPool: '2045be90', getRewardTokens: 'c4f59f9b', rewardRateOf: '221ca18c',
-  earned: '3e491d47', getPool: '28af8d0b', totalSupply: '18160ddd', tokenByIndex: '4f6ccce7' };
-async function ramsesInfo(chain, factory) { // { voter, npm }, remembered per chain
+  earned: '3e491d47', getPool: '28af8d0b', totalSupply: '18160ddd', tokenByIndex: '4f6ccce7', clGaugeFactory: '7bebe381', getPoolAt: '068bcd8d' };
+async function ramsesInfo(chain, factory, pool) { // { voter, npm }, remembered per chain
   let all = {}; try { all = JSON.parse(store.get('ramses.info', '{}')); } catch (e) {}
   if (all[chain.key]?.npm) return all[chain.key];
-  const v = (await multiCall([call(factory, RAM_SEL.voter)], chain))[0];
-  if (!v?.result || v.result === '0x') throw new Error(`couldn't read the Ramses voter on ${chain.name}`);
-  const voter = addr(words(v.result)[0]);
-  const n = (await multiCall([call(voter, RAM_SEL.nfpManager)], chain))[0];
-  if (!n?.result || n.result === '0x') throw new Error(`couldn't read the Ramses position manager on ${chain.name}`);
-  all[chain.key] = { voter, npm: addr(words(n.result)[0]) };
+  const read = async (to, data) => { // an address returned by a view call, or null
+    if (!to) return null;
+    const x = (await multiCall([call(to, data)], chain))[0];
+    const a = x?.result && x.result.length >= 66 ? addr(words(x.result)[0]) : null;
+    return a && a !== ZERO ? a : null;
+  };
+  const voter = await read(factory, RAM_SEL.voter);
+  if (!voter) throw new Error(`couldn't read the Ramses voter on ${chain.name}`);
+  // The position manager, by whichever route this deployment supports: the voter, its CL gauge factory, or a pool's gauge.
+  let npm = await read(voter, RAM_SEL.nfpManager);
+  if (!npm) npm = await read(await read(voter, RAM_SEL.clGaugeFactory), RAM_SEL.nfpManager);
+  if (!npm) {
+    const anyPool = pool || await read(voter, RAM_SEL.getPoolAt + encId(0));
+    if (anyPool) npm = await read(await read(voter, RAM_SEL.gaugeForPool + pad(anyPool)), RAM_SEL.nfpManager);
+  }
+  if (!npm) throw new Error(`couldn't read the Ramses position manager on ${chain.name} (tried the voter, its gauge factory and a gauge)`);
+  all[chain.key] = { voter, npm };
   store.set('ramses.info', JSON.stringify(all));
   return all[chain.key];
 }
@@ -1420,7 +1431,7 @@ async function loadV3Style(address, onUpdate) {
   let gauge = null;
   if (isSlipstream) gauge = addr(r(12)[0]);
   else if (isRamses) {
-    pool.ramses = await ramsesInfo(chain, factory);
+    pool.ramses = await ramsesInfo(chain, factory, address);
     const rg = await ramsesGauge(chain, pool.ramses.voter, address).catch(() => null);
     if (rg?.main) pool.gauge = { address: rg.address, rewardRate: rg.main.rate, rewardToken: rg.main.token, active: rg.main.rate > 0n,
       stakedActiveL: pool.liquidity, style: 'ramses', nft: pool.ramses.npm }; // every in-range position shares the rewards
