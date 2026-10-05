@@ -2987,8 +2987,59 @@ function trPriceCall(p) {
   if (p.kind === 'algebra') return call(p.pool, SEL.globalState);
   return call(p.pool, SEL.slot0);
 }
+// Each minute, before the price check: has any position changed shape since discovery? Liquidity added or removed,
+// a position closed or burned, a new NFT in a wallet (or one moved out, e.g. staked), or a new Uniswap v4 NFT sent to
+// a wallet. If so, positions are re-discovered straight away instead of at the next 15-minute refresh.
+async function trQuickChanges() {
+  TR.nftBal = TR.nftBal || {};
+  let changed = false;
+  for (const chainKey of Object.keys(CHAINS)) {
+    const chain = CHAINS[chainKey], ps = TR.positions.filter(p => p.chain === chainKey);
+    const reqs = [], refs = [];
+    for (const p of ps) {
+      reqs.push(p.kind === 'v4' ? call(V4.posm, TR_SEL.getPositionLiquidity + encId(p.id)) : call(p.nft, SEL.positions + encId(p.id)));
+      refs.push(['L', p]);
+    }
+    for (const w of TR.wallets) for (const src of TR_SOURCES.filter(x => x.chain === chainKey && x.nft)) {
+      reqs.push(call(src.nft, TR_SEL.balanceOf + pad(w.address))); refs.push(['B', src.nft + ':' + w.address]);
+    }
+    if (!reqs.length) continue;
+    let res;
+    try { res = await multiCall(reqs, chain); } catch (e) { continue; }
+    res.forEach((x, i) => {
+      const [k, ref] = refs[i];
+      if (transient(x)) return;
+      const w = x?.result && x.result !== '0x' ? words(x.result) : null;
+      if (k === 'L') {
+        if (!w) { changed = true; return; } // burned
+        const li = ref.kind === 'v4' ? 0 : ref.kind === 'ramses' && TR_SOURCES.find(z => z.nft === ref.nft)?.layout !== 12 ? 5 : 7;
+        if (U(w[li]).toString() !== ref.L) changed = true;
+      } else if (w) {
+        const n = U(w[0]).toString();
+        if (TR.nftBal[ref] != null && TR.nftBal[ref] !== n) changed = true;
+        TR.nftBal[ref] = n;
+      }
+    });
+  }
+  for (const w of TR.wallets) { // Uniswap v4 can't list a wallet's NFTs: look for new transfers to it since the last refresh
+    const st = TR.v4[w.address]; if (!st) continue;
+    try {
+      const { logs } = await trLogsRpc(CHAINS.ethereum, V4.posm, [TRANSFER, null, '0x' + pad(w.address)], st.block + 1);
+      if (logs.some(l => !st.ids.includes(BigInt(l.topics[3]).toString()))) changed = true;
+    } catch (e) {}
+  }
+  return changed;
+}
 async function trCheck(force) {
-  if (TR.checking || !TR.positions.length) { trRender(); return; }
+  if (TR.checking) { trRender(); return; }
+  if (!TR.discovering && TR.lastDiscover && Date.now() - TR.lastDiscover > 20000) {
+    TR.checking = true; trStatus('Checking for changed positions…');
+    let changed = false;
+    try { changed = await trQuickChanges(); } catch (e) {}
+    TR.checking = false;
+    if (changed) { trStatus('A position changed: refreshing your positions…'); TR.nextCheck = Date.now() + TR_CHECK_MS; trDiscover(); return; }
+  }
+  if (!TR.positions.length) { TR.lastCheck = Date.now(); TR.nextCheck = TR.lastCheck + TR_CHECK_MS; trRender(); return; }
   TR.checking = true; trStatus('Checking positions…');
   const failed = [];
   for (const chainKey of Object.keys(CHAINS)) {
@@ -3538,7 +3589,7 @@ function trTick() {
   // Discovery (which can take a while) runs alongside the minute checks of the positions already known.
   const now = Date.now();
   if (!TR.discovering && now - TR.lastDiscover > TR_DISCOVER_MS) trDiscover();
-  if (!TR.checking && TR.positions.length && now >= TR.nextCheck) { trCheck(); return; }
+  if (!TR.checking && !TR.discovering && now >= TR.nextCheck) { trCheck(); return; }
   if (TR.discovering || TR.checking) return;
   if (!TR.detailing && TR.positions.some(p => !TR.details[p.key] || now - TR.details[p.key].t > TR_DETAIL_MS)) trLoadDetails(TR.positions);
   trStatus(`${TR.lastCheck ? `Updated ${new Date(TR.lastCheck).toLocaleTimeString()} · ` : ''}checks every minute while this tab is open · next in ${Math.max(0, Math.ceil((TR.nextCheck - now) / 1000))}s`);
